@@ -1,0 +1,5 @@
+{
+  "name": "Mon Coach Jeûne",
+  "description": "An interactive web application to track and manage your intermittent fasting journey. Log daily progress, monitor moods, track activities, and view your history to stay motivated.",
+  "requestFramePermissions": []
+}
