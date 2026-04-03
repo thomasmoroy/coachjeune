@@ -1,695 +1,1001 @@
-import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
-import { AppState, DayState, WeekHistory } from './types';
-import { DAY_DESCRIPTIONS, ACTIVITIES, MOODS } from './constants';
-import { CheckIcon, SunIcon, MoonIcon, CloseIcon, GitHubIcon, SupabaseIcon, RobotIcon } from './components/Icons';
-import type confetti from 'canvas-confetti';
-import { GoogleGenAI } from '@google/genai';
+import React, { useState, useEffect, useRef, useCallback } from 'react';
 
-declare global {
-    interface Window {
-        confetti: typeof confetti;
-        supabase: any;
-    }
+// --- Types ---
+interface Position {
+  x: number;
+  y: number;
 }
 
-// --- Supabase Constants ---
-const USER_ID = '00000000-0000-0000-0000-000000000001'; // Hardcoded user ID for this single-user version
-const SUPABASE_PROJECT_ID = 'gjfkuflstdvvwmmxctpp';
+interface Velocity {
+  vx: number;
+  vy: number;
+}
 
-// --- Script de configuration Supabase ---
-const SUPABASE_SETUP_SQL = `-- 1. Crée la table pour stocker les données
-CREATE TABLE public.profiles (
-  id uuid NOT NULL PRIMARY KEY,
-  updated_at timestamptz,
-  app_state jsonb
-);
+interface Entity extends Position, Velocity {
+  id: number;
+  width: number;
+  height: number;
+  color: string;
+  health: number;
+  maxHealth: number;
+}
 
--- 2. Active la sécurité au niveau des lignes (Row Level Security)
-ALTER TABLE public.profiles ENABLE ROW LEVEL SECURITY;
+interface Player extends Entity {
+  speed: number;
+  fireRate: number;
+  lastFired: number;
+  weaponLevel: number;
+  invincible: boolean;
+  invincibleTimer: number;
+}
 
--- 3. Crée les politiques d'accès pour autoriser la lecture et l'écriture
--- Cette politique autorise tout le monde (rôle "anon") à lire et écrire,
--- ce qui est adapté pour cette application publique mono-utilisateur.
-CREATE POLICY "Allow public read and write access"
-ON public.profiles
-FOR ALL -- Autorise SELECT, INSERT, UPDATE, DELETE
-USING (true)
-WITH CHECK (true);`;
+interface Enemy extends Entity {
+  type: 'basic' | 'fast' | 'tank' | 'shooter';
+  scoreValue: number;
+  shootCooldown?: number;
+}
 
+interface Bullet extends Entity {
+  isPlayer: boolean;
+  damage: number;
+}
 
-// Helper Functions
-const playSound = (soundRef: React.RefObject<HTMLAudioElement>) => {
-    if (soundRef.current) {
-        soundRef.current.currentTime = 0;
-        soundRef.current.volume = 0.3;
-        soundRef.current.play().catch(() => {});
-    }
+interface Particle extends Position, Velocity {
+  id: number;
+  life: number;
+  maxLife: number;
+  size: number;
+  color: string;
+  decay: number;
+}
+
+interface PowerUp extends Position, Velocity {
+  id: number;
+  type: 'weapon' | 'health' | 'shield' | 'bomb';
+  width: number;
+  height: number;
+}
+
+interface Star {
+  x: number;
+  y: number;
+  size: number;
+  speed: number;
+  brightness: number;
+}
+
+interface GameState {
+  isPlaying: boolean;
+  isPaused: boolean;
+  isGameOver: boolean;
+  score: number;
+  highScore: number;
+  level: number;
+  lives: number;
+  combo: number;
+  comboTimer: number;
+}
+
+// --- Constants ---
+const CANVAS_WIDTH = 800;
+const CANVAS_HEIGHT = 600;
+const PLAYER_SPEED = 5;
+const BULLET_SPEED = 10;
+const ENEMY_SPAWN_RATE_INITIAL = 60;
+const FPS = 60;
+
+const COLORS = {
+  player: '#00ffff',
+  playerBullet: '#ff00ff',
+  enemyBasic: '#ff4444',
+  enemyFast: '#ffff00',
+  enemyTank: '#ff8800',
+  enemyShooter: '#aa00ff',
+  enemyBullet: '#ff6666',
+  powerupWeapon: '#00ff00',
+  powerupHealth: '#ff00ff',
+  powerupShield: '#0088ff',
+  powerupBomb: '#ffaa00',
+  bg: '#0a0a1a',
+  text: '#ffffff',
 };
 
-const popConfetti = (element: HTMLElement, color: string) => {
-    const rect = element.getBoundingClientRect();
-    window.confetti({
-        particleCount: 25, spread: 50,
-        origin: { x: (rect.left + rect.width / 2) / window.innerWidth, y: (rect.top + rect.height / 2) / window.innerHeight },
-        colors: [color], ticks: 100, gravity: 2, scalar: 0.8, shapes: ['circle']
+// --- Audio System ---
+class SoundSystem {
+  private ctx: AudioContext | null = null;
+  private enabled: boolean = false;
+
+  init() {
+    try {
+      this.ctx = new (window.AudioContext || (window as any).webkitAudioContext)();
+      this.enabled = true;
+    } catch (e) {
+      console.warn('Web Audio API not supported');
+    }
+  }
+
+  playTone(freq: number, type: OscillatorType, duration: number, volume: number = 0.3) {
+    if (!this.ctx || !this.enabled) return;
+    
+    const osc = this.ctx.createOscillator();
+    const gain = this.ctx.createGain();
+    
+    osc.type = type;
+    osc.frequency.setValueAtTime(freq, this.ctx.currentTime);
+    
+    gain.gain.setValueAtTime(volume, this.ctx.currentTime);
+    gain.gain.exponentialRampToValueAtTime(0.01, this.ctx.currentTime + duration);
+    
+    osc.connect(gain);
+    gain.connect(this.ctx.destination);
+    
+    osc.start();
+    osc.stop(this.ctx.currentTime + duration);
+  }
+
+  playShoot() {
+    this.playTone(800, 'square', 0.1, 0.2);
+    setTimeout(() => this.playTone(600, 'square', 0.1, 0.2), 50);
+  }
+
+  playEnemyHit() {
+    this.playTone(200, 'sawtooth', 0.15, 0.2);
+  }
+
+  playExplosion() {
+    this.playTone(100, 'sawtooth', 0.3, 0.4);
+    setTimeout(() => this.playTone(80, 'square', 0.3, 0.3), 100);
+  }
+
+  playPowerUp() {
+    this.playTone(1000, 'sine', 0.1, 0.3);
+    setTimeout(() => this.playTone(1500, 'sine', 0.15, 0.3), 100);
+  }
+
+  playPlayerHit() {
+    this.playTone(150, 'sawtooth', 0.4, 0.5);
+    setTimeout(() => this.playTone(100, 'square', 0.4, 0.4), 200);
+  }
+
+  playGameOver() {
+    [400, 350, 300, 250, 200].forEach((freq, i) => {
+      setTimeout(() => this.playTone(freq, 'sawtooth', 0.3, 0.4), i * 200);
     });
-};
-
-// --- Sub-Components defined in the same file for conciseness ---
-
-const SupabaseSetupModal: React.FC<{ error: { message: string } }> = ({ error }) => {
-    const [copied, setCopied] = React.useState(false);
-    const handleCopy = () => {
-        navigator.clipboard.writeText(SUPABASE_SETUP_SQL);
-        setCopied(true);
-        setTimeout(() => setCopied(false), 2500);
-    };
-    const projectUrl = `https://supabase.com/dashboard/project/${SUPABASE_PROJECT_ID}/sql/new`;
-
-    return (
-        <div className="fixed inset-0 bg-slate-100 dark:bg-gray-900 z-50 grid place-items-center p-4 animate-in fade-in-0">
-            <div className="bg-white dark:bg-gray-800 rounded-2xl shadow-2xl p-8 max-w-2xl w-full text-slate-800 dark:text-gray-200">
-                <h2 className="text-3xl font-extrabold mb-2 text-transparent bg-clip-text bg-gradient-to-r from-blue-500 to-emerald-500">🚀 Configuration Initiale Requise</h2>
-                <p className="text-slate-600 dark:text-gray-300 mb-8">
-                    Bienvenue ! Pour que l'application puisse sauvegarder votre progression, une petite configuration de la base de données est nécessaire. C'est une étape unique et rapide.
-                </p>
-
-                <div className="space-y-6">
-                    <div>
-                        <h3 className="font-bold text-lg mb-2 flex items-center"><span className="bg-blue-500 text-white rounded-full w-6 h-6 inline-flex items-center justify-center mr-3 font-mono text-sm">1</span> Ouvrir l'Éditeur SQL</h3>
-                        <p className="text-sm text-slate-500 dark:text-gray-400 ml-9 mb-3">Cliquez sur ce bouton pour ouvrir l'éditeur SQL de votre projet Supabase dans un nouvel onglet.</p>
-                        <a href={projectUrl} target="_blank" rel="noopener noreferrer" className="ml-9 inline-block py-2 px-5 font-semibold text-white bg-emerald-600 rounded-full shadow-lg hover:bg-emerald-700 transition-all hover:scale-105">
-                            Ouvrir Supabase
-                        </a>
-                    </div>
-
-                    <div>
-                        <h3 className="font-bold text-lg mb-2 flex items-center"><span className="bg-blue-500 text-white rounded-full w-6 h-6 inline-flex items-center justify-center mr-3 font-mono text-sm">2</span> Copier & Coller le Script</h3>
-                        <p className="text-sm text-slate-500 dark:text-gray-400 ml-9 mb-3">Copiez le script ci-dessous, collez-le dans l'éditeur Supabase, puis cliquez sur <strong>"RUN"</strong>.</p>
-                        <div className="ml-9 relative bg-slate-100 dark:bg-gray-900 rounded-lg p-4 font-mono text-sm text-slate-700 dark:text-gray-200 max-h-40 overflow-y-auto border dark:border-gray-700">
-                            <button onClick={handleCopy} className="absolute top-2 right-2 bg-slate-200 dark:bg-gray-700 hover:bg-slate-300 dark:hover:bg-gray-600 rounded-md px-3 py-1 text-xs font-semibold z-10 transition-colors">
-                                {copied ? 'Copié ! ✓' : 'Copier'}
-                            </button>
-                            <pre><code className="whitespace-pre-wrap">{SUPABASE_SETUP_SQL}</code></pre>
-                        </div>
-                    </div>
-
-                    <div>
-                         <h3 className="font-bold text-lg mb-2 flex items-center"><span className="bg-blue-500 text-white rounded-full w-6 h-6 inline-flex items-center justify-center mr-3 font-mono text-sm">3</span> Recharger l'Application</h3>
-                         <p className="text-sm text-slate-500 dark:text-gray-400 ml-9 mb-3">Une fois le script exécuté avec succès dans Supabase, revenez ici et rechargez la page.</p>
-                         <button onClick={() => window.location.reload()} className="ml-9 py-3 px-6 font-bold text-white bg-blue-500 rounded-full shadow-lg hover:bg-blue-600 transition-all hover:scale-105">
-                            Recharger la page
-                        </button>
-                    </div>
-                </div>
-
-                 <p className="text-xs text-center mt-8 text-slate-400 dark:text-gray-500">
-                    Message technique : <code className="font-mono bg-slate-100 dark:bg-gray-700/50 p-1 rounded-md">{error.message}</code>
-                 </p>
-            </div>
-        </div>
-    );
-};
-
-const LoadingOverlay: React.FC = () => (
-     <div className="fixed inset-0 bg-slate-100 dark:bg-gray-900 z-50 grid place-items-center p-8 text-center">
-        <div className="flex flex-col items-center">
-            <h1 className="text-4xl font-extrabold mb-2 bg-gradient-to-r from-blue-500 to-emerald-500 text-transparent bg-clip-text animate-pulse">Mon Coach Jeûne</h1>
-            <p className="text-slate-500 dark:text-gray-400">Chargement des données...</p>
-        </div>
-    </div>
-)
-
-interface TopBarProps {
-    theme: 'light' | 'dark';
-    onThemeToggle: () => void;
-}
-const TopBar: React.FC<TopBarProps> = ({ theme, onThemeToggle }) => {
-    const [timer, setTimer] = useState({ statusText: "Chargement...", countdown: "--:--:--", color: "gray-400" });
-    const [greeting, setGreeting] = useState("Bonjour");
-
-    useEffect(() => {
-        const intervalId = setInterval(() => {
-            const now = new Date();
-            const day = now.getDay(); // 0=Sunday, 6=Saturday
-            const hrs = now.getHours();
-            setGreeting(hrs >= 5 && hrs < 18 ? "Bonjour," : "Bonsoir,");
-
-            if (day === 0 || day === 6) {
-                setTimer({ statusText: "Mode Week-end", countdown: day === 6 ? "Recharge" : "Basket !", color: "pink-500" });
-                return;
-            }
-
-            const isEating = hrs >= 12 && hrs < 21;
-            let target = new Date(now);
-            if (isEating) {
-                target.setHours(21, 0, 0, 0);
-                const diff = target.getTime() - now.getTime();
-                setTimer({ statusText: "Fenêtre Alimentation", countdown: new Date(diff).toISOString().substr(11, 8), color: "amber-500" });
-            } else {
-                if (hrs >= 21) target.setDate(target.getDate() + 1);
-                target.setHours(12, 0, 0, 0);
-                const diff = target.getTime() - now.getTime();
-                setTimer({ statusText: "En Jeûne (Brûle-graisse)", countdown: new Date(diff).toISOString().substr(11, 8), color: "purple-500" });
-            }
-        }, 1000);
-        return () => clearInterval(intervalId);
-    }, []);
-
-    const dotColor = `bg-${timer.color} shadow-[0_0_10px] shadow-${timer.color}`;
-
-    return (
-        <>
-            <div className="flex justify-between items-center mb-4">
-                <div className={`flex items-center gap-4 bg-white dark:bg-gray-800 border border-slate-200 dark:border-gray-700 shadow-md rounded-full py-2 px-5 transition-colors`}>
-                    <div className={`w-3 h-3 rounded-full animate-pulse ${dotColor}`}></div>
-                    <div>
-                        <div className="text-xs font-semibold text-slate-500 dark:text-gray-400">{timer.statusText}</div>
-                        <div className="text-lg font-extrabold text-slate-800 dark:text-gray-100 tracking-wider">{timer.countdown}</div>
-                    </div>
-                </div>
-                <button onClick={onThemeToggle} className="p-2 rounded-full hover:bg-slate-200 dark:hover:bg-gray-700 transition-colors">
-                    {theme === 'light' ? <MoonIcon /> : <SunIcon />}
-                </button>
-            </div>
-            <header className="text-center my-8 md:my-12">
-                <span className="text-sm font-semibold text-slate-500 dark:text-gray-400 uppercase tracking-widest">{greeting}</span>
-                <h1 className="text-4xl md:text-5xl font-extrabold bg-gradient-to-r from-blue-500 to-emerald-500 text-transparent bg-clip-text tracking-tighter">Mon Coach Jeûne</h1>
-            </header>
-        </>
-    );
-};
-
-interface DashboardProps {
-    week: number;
-    days: DayState[];
-    historyLength: number;
-    onShowHistory: () => void;
-}
-const Dashboard: React.FC<DashboardProps> = ({ week, days, historyLength, onShowHistory }) => {
-    const doneCount = days.slice(0, 5).filter(d => d.done).length;
-    const stats = [
-        { label: 'Semaine Actuelle', value: week },
-        { label: 'Objectif', value: `${doneCount}/5` },
-        { label: 'Semaines Validées', value: historyLength },
-        { label: "Voir l'historique", value: '📜', onClick: onShowHistory }
-    ];
-    return (
-        <div className="grid grid-cols-2 md:grid-cols-4 gap-4 mb-8">
-            {stats.map(stat => (
-                <div key={stat.label} onClick={stat.onClick} className={`bg-white dark:bg-gray-800 p-5 rounded-2xl shadow-md border border-slate-200 dark:border-gray-700 text-center transition-transform hover:-translate-y-1 ${stat.onClick ? 'cursor-pointer' : ''}`}>
-                    <div className="text-xs font-semibold text-slate-500 dark:text-gray-400 uppercase tracking-wider mb-2">{stat.label}</div>
-                    <div className="text-4xl font-extrabold text-slate-800 dark:text-gray-100">{stat.value}</div>
-                </div>
-            ))}
-        </div>
-    );
-};
-
-interface DayCardProps {
-    dayIndex: number;
-    dayState: DayState;
-    onToggleDone: (index: number, el: HTMLElement) => void;
-    onSetMood: (index: number, mood: number) => void;
-    onActivityChange: (index: number, activity: string) => void;
-    onToggleActivityDone: (index: number, el: HTMLElement) => void;
-    onNoteChange: (index: number, note: string) => void;
+  }
 }
 
-const DayCard: React.FC<DayCardProps> = ({ dayIndex, dayState, onToggleDone, onSetMood, onActivityChange, onToggleActivityDone, onNoteChange }) => {
-    const dayDesc = DAY_DESCRIPTIONS[dayIndex];
-    let currentDayIndex = new Date().getDay() - 1;
-    if (currentDayIndex === -1) currentDayIndex = 6;
-    const isToday = dayIndex === currentDayIndex;
+const soundSystem = new SoundSystem();
 
-    const checkRef = useRef<HTMLDivElement>(null);
-    const activityCheckRef = useRef<HTMLDivElement>(null);
-    
-    const baseCardClasses = "transition-all duration-300 rounded-xl p-5 border";
-    const typeCardClasses = dayDesc.rest ? "bg-amber-50 border-amber-200 dark:bg-gray-800/50 dark:border-amber-900/50" : "bg-white border-slate-200 dark:bg-gray-800 dark:border-gray-700";
-    const stateCardClasses = dayState.done ? "opacity-60" : "shadow-md";
-
-    return (
-        <div className={`day-card ${baseCardClasses} ${typeCardClasses} ${stateCardClasses} ${isToday ? 'is-today' : ''} ${dayState.done ? 'completed' : ''}`}>
-            <div className="flex items-start gap-4">
-                <div ref={checkRef} onClick={() => checkRef.current && onToggleDone(dayIndex, checkRef.current)} className="cursor-pointer pt-1">
-                    <div className={`w-7 h-7 rounded-lg flex-shrink-0 grid place-items-center transition-all duration-300 transform active:scale-90 ${dayState.done ? (dayDesc.rest ? 'bg-pink-500' : 'bg-emerald-500') : 'bg-slate-200 dark:bg-gray-700'}`}>
-                        {dayState.done && <CheckIcon className="text-white"/>}
-                    </div>
-                </div>
-
-                <div className="flex-grow">
-                    <h3 className={`font-bold text-lg text-slate-800 dark:text-gray-100 ${dayState.done ? 'line-through' : ''}`}>{dayDesc.t}</h3>
-                    <p className="text-sm text-slate-500 dark:text-gray-400">{dayDesc.d}</p>
-                    
-                    {!dayDesc.rest && (
-                        <>
-                            <div className={`mt-4 pt-3 border-t border-dashed border-slate-200 dark:border-gray-600 flex items-center gap-3 transition-opacity ${dayState.done ? 'opacity-50' : ''}`}>
-                                <div ref={activityCheckRef} onClick={() => activityCheckRef.current && onToggleActivityDone(dayIndex, activityCheckRef.current)} className="cursor-pointer">
-                                    <div className={`w-6 h-6 rounded-full flex-shrink-0 grid place-items-center transition-all duration-300 transform active:scale-90 ${dayState.activityDone ? 'bg-blue-500' : 'bg-slate-200 dark:bg-gray-700'}`}>
-                                        {dayState.activityDone && <CheckIcon className="text-white w-4 h-4"/>}
-                                    </div>
-                                </div>
-                                <select value={dayState.selectedActivity} onChange={(e) => onActivityChange(dayIndex, e.target.value)} className="w-full bg-slate-100 dark:bg-gray-900/50 border border-slate-200 dark:border-gray-600 rounded-md p-1 text-sm font-semibold text-slate-700 dark:text-gray-200 outline-none focus:ring-2 focus:ring-blue-500">
-                                    {ACTIVITIES.map(act => <option key={act.name} value={act.name}>{act.icon} {act.name}</option>)}
-                                </select>
-                            </div>
-
-                            {dayState.done && (
-                                <div className="mt-4 flex gap-2">
-                                    {MOODS.map((mood, moodIndex) => (
-                                        <button key={mood.icon} onClick={() => onSetMood(dayIndex, moodIndex)} className={`flex-1 text-2xl py-1 rounded-lg border transition-all duration-200 transform hover:-translate-y-0.5 ${dayState.mood === moodIndex ? 'bg-blue-500 border-blue-500 scale-105 shadow-lg' : 'bg-slate-100 dark:bg-gray-700 border-slate-200 dark:border-gray-600 opacity-60 hover:opacity-100'}`}>
-                                            {mood.icon}
-                                        </button>
-                                    ))}
-                                </div>
-                            )}
-
-                            <div className="mt-4">
-                                <textarea
-                                    value={dayState.note}
-                                    onChange={(e) => onNoteChange(dayIndex, e.target.value)}
-                                    placeholder="Vos pensées, faim, énergie..."
-                                    className="w-full bg-slate-100 dark:bg-gray-900/50 border border-slate-200 dark:border-gray-600 rounded-md p-2 text-sm text-slate-700 dark:text-gray-200 outline-none focus:ring-2 focus:ring-blue-500"
-                                    rows={2}
-                                />
-                            </div>
-                        </>
-                    )}
-                </div>
-            </div>
-        </div>
-    );
+// --- Helper Functions ---
+const randomRange = (min: number, max: number) => Math.random() * (max - min) + min;
+const checkCollision = (a: Entity | Bullet | Player, b: Entity | Bullet | Player | PowerUp) => {
+  return (
+    a.x < b.x + (b as any).width &&
+    a.x + a.width > b.x &&
+    a.y < b.y + (b as any).height &&
+    a.y + a.height > b.y
+  );
 };
 
-interface SummaryModalProps {
-    isOpen: boolean;
-    onClose: () => void;
-    days: DayState[];
-}
-const SummaryModal: React.FC<SummaryModalProps> = ({ isOpen, onClose, days }) => {
-    if (!isOpen) return null;
-    const doneCount = days.slice(0, 5).filter(d => d.done).length;
-    const activityCount = days.filter(d => d.activityDone).length;
-    const moods = days.slice(0, 5).filter(d => d.mood !== null).map(d => d.mood!);
-    const avgMoodIndex = moods.length ? Math.round(moods.reduce((a, b) => a + b, 0) / moods.length) : 1;
-    const title = doneCount === 5 ? "🎉 Objectif atteint !" : "✅ Bilan de la Semaine";
-    return (
-        <div className="fixed inset-0 bg-black/50 backdrop-blur-sm z-40 grid place-items-center p-4">
-            <div className="bg-white dark:bg-gray-800 rounded-2xl shadow-2xl p-8 max-w-md w-full text-center transform transition-transform scale-95 animate-in fade-in-0 zoom-in-95">
-                <h2 className="text-2xl font-extrabold mb-4 text-slate-800 dark:text-gray-100">{title}</h2>
-                <div className="text-slate-600 dark:text-gray-300 space-y-2">
-                    <p>Vous avez validé <b>{doneCount}/5</b> jours de jeûne.</p>
-                    {activityCount > 0 && <p>Et bravo pour les <b>{activityCount} activité(s) physique(s)</b> !</p>}
-                    {moods.length > 0 && <p className="mt-4">Ressenti global : <b>{MOODS[avgMoodIndex].icon} {MOODS[avgMoodIndex].label}</b></p>}
-                </div>
-                <button onClick={onClose} className="mt-8 w-full px-8 py-3 text-lg font-bold text-white bg-gradient-to-r from-blue-500 to-emerald-500 rounded-full shadow-lg hover:scale-105 transition-transform">Go Semaine Suivante</button>
-            </div>
-        </div>
-    );
-};
-
-interface HistoryModalProps {
-    isOpen: boolean;
-    onClose: () => void;
-    history: WeekHistory[];
-}
-const HistoryModal: React.FC<HistoryModalProps> = ({isOpen, onClose, history}) => {
-    if (!isOpen) return null;
-    return (
-        <div className="fixed inset-0 bg-black/50 backdrop-blur-sm z-40 grid place-items-center p-4">
-             <div className="bg-white dark:bg-gray-800 rounded-2xl shadow-2xl p-6 max-w-md w-full relative transform transition-transform scale-95 animate-in fade-in-0 zoom-in-95">
-                <button onClick={onClose} className="absolute top-4 right-4 text-slate-400 hover:text-slate-800 dark:hover:text-white transition">
-                    <CloseIcon />
-                </button>
-                <h2 className="text-2xl font-extrabold mb-4 text-slate-800 dark:text-gray-100">📚 Historique</h2>
-                <ul className="max-h-[60vh] overflow-y-auto space-y-2 pr-2">
-                    {history.length > 0 ? [...history].reverse().map(weekData => {
-                        const fasts = weekData.days.slice(0, 5).filter(d => d.done).length;
-                        const activities = weekData.days.filter(d => d.activityDone).length;
-                        return (
-                            <li key={weekData.week} className="p-4 bg-slate-50 dark:bg-gray-700/50 rounded-lg border border-slate-200 dark:border-gray-700">
-                                <p className="font-bold text-slate-800 dark:text-gray-100">Semaine {weekData.week}</p>
-                                <p className="text-sm text-slate-500 dark:text-gray-400">Jeûnes : {fasts}/5 &nbsp;&nbsp;•&nbsp;&nbsp; Activités : {activities}</p>
-                            </li>
-                        )
-                    }) : <li className="p-4 text-center text-slate-500 dark:text-gray-400">Aucune semaine terminée pour le moment.</li>}
-                </ul>
-            </div>
-        </div>
-    )
-}
-
-interface DailyCoachProps {
-    state: { status: 'idle' | 'loading' | 'success' | 'error'; message: string };
-    onAsk: () => void;
-}
-const DailyCoach: React.FC<DailyCoachProps> = ({ state, onAsk }) => {
-    return (
-        <div className="space-y-3">
-            <button
-                onClick={onAsk}
-                disabled={state.status === 'loading'}
-                className="w-full text-center py-3 px-6 font-bold text-white bg-gradient-to-r from-purple-500 to-indigo-500 rounded-full shadow-lg hover:scale-105 transition-all disabled:opacity-50 disabled:cursor-not-allowed disabled:scale-100 flex items-center justify-center gap-2"
-            >
-                <RobotIcon className="w-5 h-5"/>
-                Coach du Jour
-            </button>
-            {state.status !== 'idle' && (
-                <div className="bg-white dark:bg-gray-800 p-5 rounded-2xl shadow-md border border-slate-200 dark:border-gray-700 animate-in fade-in-0">
-                    <h3 className="text-lg font-bold mb-2 flex items-center gap-2 text-slate-700 dark:text-gray-200">
-                        <RobotIcon className="w-5 h-5 text-purple-500"/>
-                        Message du Coach
-                    </h3>
-                    {state.status === 'loading' && (
-                        <p className="text-sm text-slate-500 dark:text-gray-400">{state.message}</p>
-                    )}
-                    {state.status === 'success' && (
-                        <p className="text-sm text-slate-600 dark:text-gray-300 whitespace-pre-wrap">{state.message}{state.message.length > 0 && state.status === 'success' && <span className="inline-block w-2 h-4 bg-purple-500 ml-1 animate-pulse"></span>}</p>
-                    )}
-                    {state.status === 'error' && (
-                        <p className="text-sm text-red-500">{state.message}</p>
-                    )}
-                </div>
-            )}
-        </div>
-    );
-};
-
-
-// --- Main App Component ---
-
+// --- Main Component ---
 const App: React.FC = () => {
-    const supabase = useMemo(() => {
-        if (window.supabase) {
-            const { createClient } = window.supabase;
-            const supabaseUrl = 'https://gjfkuflstdvvwmmxctpp.supabase.co';
-            const supabaseAnonKey = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImdqZmt1ZmxzdGR2dndtbXhjdHBwIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NjEwODg5MjEsImV4cCI6MjA3NjY2NDkyMX0.qH3qW2R_ntvi9w8uKLPyARyf52hNVq0apkCsAnLHVak';
-            return createClient(supabaseUrl, supabaseAnonKey);
-        }
-        return null;
-    }, []);
-    
-    const ai = useMemo(() => {
-        // Assume process.env.API_KEY is available in the execution environment
-        return new GoogleGenAI({ apiKey: process.env.API_KEY as string });
-    }, []);
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+  const [gameState, setGameState] = useState<GameState>({
+    isPlaying: false,
+    isPaused: false,
+    isGameOver: false,
+    score: 0,
+    highScore: parseInt(localStorage.getItem('shmup_highscore') || '0'),
+    level: 1,
+    lives: 3,
+    combo: 0,
+    comboTimer: 0,
+  });
+  const [uiScore, setUiScore] = useState(0);
+  const [uiLives, setUiLives] = useState(3);
+  const [uiLevel, setUiLevel] = useState(1);
+  const [uiCombo, setUiCombo] = useState(0);
 
-    const [state, setState] = useState<'loading' | AppState>('loading');
-    const [setupError, setSetupError] = useState<any | null>(null);
-    const [syncStatus, setSyncStatus] = useState<'synced' | 'saving' | 'error'>('synced');
-    const [isSummaryModalOpen, setSummaryModalOpen] = useState(false);
-    const [isHistoryModalOpen, setHistoryModalOpen] = useState(false);
-    const [dailyCoachState, setDailyCoachState] = useState<{ status: 'idle' | 'loading' | 'success' | 'error'; message: string }>({ status: 'idle', message: '' });
-    const stateRef = useRef(state);
+  // Game entities refs for performance
+  const playerRef = useRef<Player | null>(null);
+  const bulletsRef = useRef<Bullet[]>([]);
+  const enemiesRef = useRef<Enemy[]>([]);
+  const particlesRef = useRef<Particle[]>([]);
+  const powerUpsRef = useRef<PowerUp[]>([]);
+  const starsRef = useRef<Star[]>([]);
+  const keysRef = useRef<{ [key: string]: boolean }>({});
+  const frameCountRef = useRef(0);
+  const enemySpawnRateRef = useRef(ENEMY_SPAWN_RATE_INITIAL);
+  const animationFrameRef = useRef<number>(0);
 
-    const sfx = {
-        check: useRef<HTMLAudioElement>(null),
-        activity: useRef<HTMLAudioElement>(null),
-        win: useRef<HTMLAudioElement>(null),
+  // Initialize stars background
+  const initStars = useCallback(() => {
+    const stars: Star[] = [];
+    for (let i = 0; i < 100; i++) {
+      stars.push({
+        x: Math.random() * CANVAS_WIDTH,
+        y: Math.random() * CANVAS_HEIGHT,
+        size: Math.random() * 2 + 0.5,
+        speed: Math.random() * 2 + 0.5,
+        brightness: Math.random(),
+      });
+    }
+    starsRef.current = stars;
+  }, []);
+
+  // Initialize player
+  const initPlayer = useCallback(() => {
+    playerRef.current = {
+      id: Date.now(),
+      x: CANVAS_WIDTH / 2 - 20,
+      y: CANVAS_HEIGHT - 80,
+      vx: 0,
+      vy: 0,
+      width: 40,
+      height: 40,
+      color: COLORS.player,
+      health: 1,
+      maxHealth: 1,
+      speed: PLAYER_SPEED,
+      fireRate: 10,
+      lastFired: 0,
+      weaponLevel: 1,
+      invincible: false,
+      invincibleTimer: 0,
+    };
+  }, []);
+
+  // Spawn enemy
+  const spawnEnemy = useCallback(() => {
+    if (!playerRef.current) return;
+
+    const rand = Math.random();
+    let type: Enemy['type'] = 'basic';
+    let width = 30;
+    let height = 30;
+    let health = 1;
+    let speed = 2;
+    let color = COLORS.enemyBasic;
+    let scoreValue = 100;
+
+    if (rand < 0.1 && gameState.level >= 2) {
+      type = 'tank';
+      width = 50;
+      height = 50;
+      health = 5;
+      speed = 1;
+      color = COLORS.enemyTank;
+      scoreValue = 300;
+    } else if (rand < 0.3 && gameState.level >= 2) {
+      type = 'fast';
+      width = 25;
+      height = 25;
+      health = 1;
+      speed = 4;
+      color = COLORS.enemyFast;
+      scoreValue = 150;
+    } else if (rand < 0.5 && gameState.level >= 3) {
+      type = 'shooter';
+      width = 35;
+      height = 35;
+      health = 2;
+      speed = 1.5;
+      color = COLORS.enemyShooter;
+      scoreValue = 200;
+    }
+
+    const enemy: Enemy = {
+      id: Date.now() + Math.random(),
+      x: Math.random() * (CANVAS_WIDTH - width),
+      y: -50,
+      vx: type === 'fast' ? randomRange(-1, 1) : 0,
+      vy: speed,
+      width,
+      height,
+      color,
+      health,
+      maxHealth: health,
+      type,
+      scoreValue,
+      shootCooldown: type === 'shooter' ? 120 : undefined,
     };
 
-    useEffect(() => {
-        stateRef.current = state;
-        if (state !== 'loading') {
-            document.documentElement.classList.toggle('dark', state.theme === 'dark');
+    enemiesRef.current.push(enemy);
+  }, [gameState.level]);
+
+  // Create explosion particles
+  const createExplosion = useCallback((x: number, y: number, color: string, count: number = 15) => {
+    for (let i = 0; i < count; i++) {
+      const angle = (Math.PI * 2 * i) / count + randomRange(-0.2, 0.2);
+      const speed = randomRange(2, 6);
+      particlesRef.current.push({
+        id: Date.now() + Math.random(),
+        x,
+        y,
+        vx: Math.cos(angle) * speed,
+        vy: Math.sin(angle) * speed,
+        life: 1,
+        maxLife: 1,
+        size: randomRange(2, 5),
+        color,
+        decay: randomRange(0.02, 0.05),
+      });
+    }
+  }, []);
+
+  // Spawn power-up
+  const spawnPowerUp = useCallback((x: number, y: number) => {
+    if (Math.random() > 0.15) return; // 15% chance
+
+    const types: PowerUp['type'][] = ['weapon', 'health', 'shield', 'bomb'];
+    const type = types[Math.floor(Math.random() * types.length)];
+    let color = COLORS.powerupWeapon;
+
+    switch (type) {
+      case 'health': color = COLORS.powerupHealth; break;
+      case 'shield': color = COLORS.powerupShield; break;
+      case 'bomb': color = COLORS.powerupBomb; break;
+    }
+
+    powerUpsRef.current.push({
+      id: Date.now() + Math.random(),
+      x,
+      y,
+      vx: 0,
+      vy: 2,
+      type,
+      width: 25,
+      height: 25,
+    });
+  }, []);
+
+  // Start game
+  const startGame = useCallback(() => {
+    soundSystem.init();
+    initStars();
+    initPlayer();
+    bulletsRef.current = [];
+    enemiesRef.current = [];
+    particlesRef.current = [];
+    powerUpsRef.current = [];
+    frameCountRef.current = 0;
+    enemySpawnRateRef.current = ENEMY_SPAWN_RATE_INITIAL;
+
+    setGameState({
+      isPlaying: true,
+      isPaused: false,
+      isGameOver: false,
+      score: 0,
+      highScore: parseInt(localStorage.getItem('shmup_highscore') || '0'),
+      level: 1,
+      lives: 3,
+      combo: 0,
+      comboTimer: 0,
+    });
+    setUiScore(0);
+    setUiLives(3);
+    setUiLevel(1);
+    setUiCombo(0);
+  }, [initStars, initPlayer]);
+
+  // Handle keyboard input
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      keysRef.current[e.code] = true;
+      
+      if (e.code === 'Escape' && gameState.isPlaying) {
+        setGameState(prev => ({ ...prev, isPaused: !prev.isPaused }));
+      }
+      
+      if (e.code === 'Enter' && (gameState.isGameOver || !gameState.isPlaying)) {
+        startGame();
+      }
+    };
+
+    const handleKeyUp = (e: KeyboardEvent) => {
+      keysRef.current[e.code] = false;
+    };
+
+    window.addEventListener('keydown', handleKeyDown);
+    window.addEventListener('keyup', handleKeyUp);
+
+    return () => {
+      window.removeEventListener('keydown', handleKeyDown);
+      window.removeEventListener('keyup', handleKeyUp);
+    };
+  }, [gameState.isPlaying, gameState.isGameOver, startGame]);
+
+  // Game loop
+  useEffect(() => {
+    if (!gameState.isPlaying || gameState.isPaused || gameState.isGameOver) {
+      return;
+    }
+
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+
+    let lastTime = performance.now();
+
+    const gameLoop = (currentTime: number) => {
+      const deltaTime = currentTime - lastTime;
+      lastTime = currentTime;
+
+      // Clear canvas
+      ctx.fillStyle = COLORS.bg;
+      ctx.fillRect(0, 0, CANVAS_WIDTH, CANVAS_HEIGHT);
+
+      // Update and draw stars
+      starsRef.current.forEach(star => {
+        star.y += star.speed;
+        if (star.y > CANVAS_HEIGHT) {
+          star.y = 0;
+          star.x = Math.random() * CANVAS_WIDTH;
         }
-    }, [state]);
+        ctx.fillStyle = `rgba(255, 255, 255, ${star.brightness})`;
+        ctx.beginPath();
+        ctx.arc(star.x, star.y, star.size, 0, Math.PI * 2);
+        ctx.fill();
+      });
 
-    // Load data from Supabase on mount
-    useEffect(() => {
-        if (!supabase) {
-            console.error("Le client Supabase n'a pas pu être chargé.");
-            setSetupError({ message: "Le client Supabase n'a pas pu être chargé. Vérifiez votre connexion internet et rechargez la page." });
-            return;
-        }
+      frameCountRef.current++;
 
-        const fetchState = async () => {
-            const { data, error } = await supabase
-                .from('profiles')
-                .select('app_state')
-                .eq('id', USER_ID)
-                .single();
+      // Player movement
+      if (playerRef.current) {
+        const player = playerRef.current;
+        
+        if (keysRef.current['ArrowLeft'] || keysRef.current['KeyQ']) player.x -= player.speed;
+        if (keysRef.current['ArrowRight'] || keysRef.current['KeyD']) player.x += player.speed;
+        if (keysRef.current['ArrowUp'] || keysRef.current['KeyZ']) player.y -= player.speed;
+        if (keysRef.current['ArrowDown'] || keysRef.current['KeyS']) player.y += player.speed;
 
-            if (error && error.code !== 'PGRST116') { // PGRST116 = no rows found
-                console.error('Erreur de chargement Supabase. Message:', error.message);
-                console.error('Objet d\'erreur complet:', error);
-                setSetupError(error);
-                setSyncStatus('error');
-            } else if (data && data.app_state) {
-                 const validatedState: AppState = { // Basic validation
-                    ...data.app_state,
-                    days: data.app_state.days.map((d: Partial<DayState>) => ({
-                        done: d.done ?? false,
-                        mood: d.mood ?? null,
-                        selectedActivity: d.selectedActivity ?? 'Aucune',
-                        activityDone: d.activityDone ?? false,
-                        note: d.note ?? '',
-                    })),
-                };
-                setState(validatedState);
-                setSyncStatus('synced');
-            } else { // No data, initialize a fresh state
-                setState({
-                    week: 1,
-                    theme: window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light',
-                    days: Array(7).fill(null).map(() => ({ done: false, mood: null, selectedActivity: 'Aucune', activityDone: false, note: '' })),
-                    history: [],
-                });
-                setSyncStatus('synced');
-            }
-        };
-        fetchState();
-    }, [supabase]);
+        // Clamp to screen
+        player.x = Math.max(0, Math.min(CANVAS_WIDTH - player.width, player.x));
+        player.y = Math.max(0, Math.min(CANVAS_HEIGHT - player.height, player.y));
 
-    // Debounced save to Supabase
-    useEffect(() => {
-        if (state === 'loading' || !supabase) return;
-        setSyncStatus('saving');
-        const handler = setTimeout(async () => {
-            const latestState = stateRef.current;
-            if (latestState !== 'loading') {
-                const { error } = await supabase
-                    .from('profiles')
-                    .upsert({ id: USER_ID, app_state: latestState, updated_at: new Date() });
-                if (error) {
-                    console.error('Erreur de sauvegarde Supabase. Message:', error.message);
-                    console.error('Objet d\'erreur complet:', error);
-                    setSyncStatus('error');
-                } else {
-                    setSyncStatus('synced');
-                }
-            }
-        }, 1000);
+        // Shooting
+        if ((keysRef.current['Space'] || keysRef.current['Enter']) && frameCountRef.current - player.lastFired > player.fireRate) {
+          player.lastFired = frameCountRef.current;
+          soundSystem.playShoot();
 
-        return () => clearTimeout(handler);
-    }, [state, supabase]);
-    
-    const handleThemeToggle = useCallback(() => {
-        setState(prevState => (prevState !== 'loading' ? { ...prevState, theme: prevState.theme === 'light' ? 'dark' : 'light' } : prevState));
-    }, []);
-    
-    const handleToggleDone = useCallback((index: number, el: HTMLElement) => {
-        setState(prevState => {
-            if (prevState === 'loading') return prevState;
-            const newDays = [...prevState.days];
-            const isDone = !newDays[index].done;
-            newDays[index] = { ...newDays[index], done: isDone, mood: isDone ? newDays[index].mood : null };
-            if (isDone) {
-                playSound(sfx.check);
-                const color = DAY_DESCRIPTIONS[index].rest ? '#ec4899' : '#10b981';
-                popConfetti(el, color);
-            }
-            return { ...prevState, days: newDays };
-        });
-    }, [sfx.check]);
+          // Create bullets based on weapon level
+          const bulletPositions = [
+            { x: player.x + player.width / 2 - 3, y: player.y, vx: 0, vy: -BULLET_SPEED },
+          ];
 
-    const handleSetMood = useCallback((index: number, mood: number) => {
-        setState(prevState => {
-            if (prevState === 'loading') return prevState;
-            const newDays = [...prevState.days];
-            newDays[index] = { ...newDays[index], mood: mood };
-            return { ...prevState, days: newDays };
-        });
-    }, []);
+          if (player.weaponLevel >= 2) {
+            bulletPositions.push(
+              { x: player.x, y: player.y + 10, vx: -2, vy: -BULLET_SPEED * 0.9 },
+              { x: player.x + player.width, y: player.y + 10, vx: 2, vy: -BULLET_SPEED * 0.9 }
+            );
+          }
 
-    const handleActivityChange = useCallback((index: number, activity: string) => {
-        setState(prevState => {
-            if (prevState === 'loading') return prevState;
-            const newDays = [...prevState.days];
-            newDays[index] = { ...newDays[index], selectedActivity: activity, activityDone: false };
-            return { ...prevState, days: newDays };
-        });
-    }, []);
+          if (player.weaponLevel >= 3) {
+            bulletPositions.push(
+              { x: player.x - 5, y: player.y + 20, vx: -3, vy: -BULLET_SPEED * 0.8 },
+              { x: player.x + player.width + 5, y: player.y + 20, vx: 3, vy: -BULLET_SPEED * 0.8 }
+            );
+          }
 
-    const handleToggleActivityDone = useCallback((index: number, el: HTMLElement) => {
-        setState(prevState => {
-            if (prevState === 'loading' || prevState.days[index].selectedActivity === "Aucune") return prevState;
-            const newDays = [...prevState.days];
-            const isActivityDone = !newDays[index].activityDone;
-            newDays[index] = { ...newDays[index], activityDone: isActivityDone };
-            if (isActivityDone) {
-                playSound(sfx.activity);
-                popConfetti(el, '#3b82f6');
-            }
-            return { ...prevState, days: newDays };
-        });
-    }, [sfx.activity]);
-
-    const handleNoteChange = useCallback((index: number, note: string) => {
-        setState(prevState => {
-            if (prevState === 'loading') return prevState;
-            const newDays = [...prevState.days];
-            newDays[index] = { ...newDays[index], note: note };
-            return { ...prevState, days: newDays };
-        });
-    }, []);
-
-    const handleValidateWeek = useCallback(() => {
-        if (state === 'loading') return;
-        const doneCount = state.days.slice(0, 5).filter(d => d.done).length;
-        if (doneCount === 5) {
-            playSound(sfx.win);
-            window.confetti({ particleCount: 150, spread: 70, origin: { y: 0.6 } });
-        }
-        setSummaryModalOpen(true);
-    }, [state, sfx.win]);
-
-    const handleNextWeek = useCallback(() => {
-        setState(prevState => {
-            if (prevState === 'loading') return prevState;
-            const newHistory = [...prevState.history, { week: prevState.week, days: prevState.days }];
-            return {
-                ...prevState,
-                week: prevState.week + 1,
-                days: Array(7).fill(null).map(() => ({ done: false, mood: null, selectedActivity: "Aucune", activityDone: false, note: "" })),
-                history: newHistory,
-            };
-        });
-        setSummaryModalOpen(false);
-        setDailyCoachState({ status: 'idle', message: '' }); // Reset AI coach
-    }, []);
-
-    const handleAskDailyCoach = useCallback(async () => {
-        if (state === 'loading') return;
-    
-        setDailyCoachState({ status: 'loading', message: 'Le coach écrit...' });
-    
-        try {
-            let currentDayIndex = new Date().getDay() - 1;
-            if (currentDayIndex === -1) currentDayIndex = 6;
-    
-            const today = state.days[currentDayIndex];
-            const dayDesc = DAY_DESCRIPTIONS[currentDayIndex];
-    
-            if (dayDesc.rest) {
-                setDailyCoachState({ status: 'success', message: 'Aujourd\'hui, c\'est repos ! Profitez-en pour bien recharger les batteries. Pas de coaching nécessaire, juste de la détente ! 😊' });
-                return;
-            }
-    
-            let statusText = today.done ? "a validé son jeûne." : "n'a pas encore validé son jeûne.";
-            let activityText = "Aucune activité n'est prévue.";
-            if (today.selectedActivity !== 'Aucune') {
-                activityText = `L'activité prévue est "${today.selectedActivity}" et elle ${today.activityDone ? 'a été faite' : 'n\'a pas encore été faite'}.`;
-            }
-            let moodText = today.done && today.mood !== null ? `Son humeur du jour est : ${MOODS[today.mood].label}.` : "Son humeur n'est pas encore enregistrée.";
-            let noteText = today.note ? `Voici sa note personnelle : "${today.note}"` : "Il/elle n'a pas laissé de note.";
-
-            const prompt = `Tu es un coach en jeûne intermittent, amical, concis et motivant. Voici le statut de l'utilisateur pour aujourd'hui (${dayDesc.t}):
-- Statut du jeûne : ${statusText}
-- Activité : ${activityText}
-- Humeur : ${moodText}
-- Note : ${noteText}
-
-Donne-lui un court conseil (2-3 phrases) pour la journée en cours ou pour l'aider à atteindre ses objectifs du jour. Sois positif, encourageant et réponds en français. Ne donne pas de conseils médicaux.`;
-
-            const stream = await ai.models.generateContentStream({
-                model: 'gemini-2.5-flash',
-                contents: prompt,
+          bulletPositions.forEach(pos => {
+            bulletsRef.current.push({
+              id: Date.now() + Math.random(),
+              x: pos.x,
+              y: pos.y,
+              vx: pos.vx,
+              vy: pos.vy,
+              width: 6,
+              height: 15,
+              color: COLORS.playerBullet,
+              health: 1,
+              maxHealth: 1,
+              isPlayer: true,
+              damage: 1,
             });
-    
-            setDailyCoachState({ status: 'success', message: '' });
-    
-            let fullText = '';
-            for await (const chunk of stream) {
-                fullText += chunk.text;
-                setDailyCoachState({ status: 'success', message: fullText });
-            }
-    
-        } catch (error) {
-            console.error("Erreur du Coach AI:", error);
-            setDailyCoachState({ status: 'error', message: 'Désolé, une erreur est survenue. Réessayez plus tard.' });
+          });
         }
-    }, [state, ai]);
 
-    if (setupError) {
-        return <SupabaseSetupModal error={setupError} />;
-    }
+        // Invincibility timer
+        if (player.invincible) {
+          player.invincibleTimer--;
+          if (player.invincibleTimer <= 0) {
+            player.invincible = false;
+          }
+        }
 
-    if (state === 'loading') {
-        return <LoadingOverlay />;
-    }
-    
-    const doneCount = state.days.slice(0,5).filter(d => d.done).length;
+        // Draw player with glow effect
+        if (!player.invincible || Math.floor(frameCountRef.current / 4) % 2 === 0) {
+          ctx.save();
+          ctx.shadowBlur = 20;
+          ctx.shadowColor = player.color;
+          ctx.fillStyle = player.color;
+          
+          // Draw ship shape
+          ctx.beginPath();
+          ctx.moveTo(player.x + player.width / 2, player.y);
+          ctx.lineTo(player.x + player.width, player.y + player.height);
+          ctx.lineTo(player.x + player.width / 2, player.y + player.height - 10);
+          ctx.lineTo(player.x, player.y + player.height);
+          ctx.closePath();
+          ctx.fill();
 
-    return (
-        <div className="bg-slate-100 dark:bg-gray-900 min-h-screen text-slate-800 dark:text-gray-200 transition-colors pb-12">
-            <audio ref={sfx.check} src="https://cdn.freesound.org/previews/242/242501_4414128-lq.mp3" preload="auto"></audio>
-            <audio ref={sfx.activity} src="https://cdn.freesound.org/previews/320/320655_5260872-lq.mp3" preload="auto"></audio>
-            <audio ref={sfx.win} src="https://cdn.freesound.org/previews/270/270404_5123851-lq.mp3" preload="auto"></audio>
+          // Engine flame
+          ctx.fillStyle = '#ff6600';
+          ctx.beginPath();
+          ctx.moveTo(player.x + player.width / 2 - 5, player.y + player.height - 5);
+          ctx.lineTo(player.x + player.width / 2 + 5, player.y + player.height - 5);
+          ctx.lineTo(player.x + player.width / 2, player.y + player.height + randomRange(10, 20));
+          ctx.closePath();
+          ctx.fill();
+          
+          ctx.restore();
+        }
+      }
 
-            <div className="container mx-auto max-w-5xl p-4">
-                <TopBar theme={state.theme} onThemeToggle={handleThemeToggle} />
-                <Dashboard week={state.week} days={state.days} historyLength={state.history.length} onShowHistory={() => setHistoryModalOpen(true)}/>
+      // Spawn enemies
+      if (frameCountRef.current % Math.floor(enemySpawnRateRef.current) === 0) {
+        spawnEnemy();
+      }
 
-                <main className="grid md:grid-cols-3 gap-8 items-start">
-                    <section className="md:col-span-2">
-                        <h2 className="text-2xl font-extrabold mb-2 text-slate-800 dark:text-gray-100">Semaine {state.week}</h2>
-                        <div className="w-full bg-slate-200 dark:bg-gray-700 rounded-full h-2.5 mb-6">
-                            <div className="bg-gradient-to-r from-blue-500 to-emerald-500 h-2.5 rounded-full transition-all duration-500" style={{ width: `${(doneCount / 5) * 100}%` }}></div>
-                        </div>
-                        <div className="space-y-4">
-                            {state.days.map((dayState, i) => (
-                                <DayCard key={i} dayIndex={i} dayState={dayState} onToggleDone={handleToggleDone} onSetMood={handleSetMood} onActivityChange={handleActivityChange} onToggleActivityDone={handleToggleActivityDone} onNoteChange={handleNoteChange} />
-                            ))}
-                        </div>
-                    </section>
-                    <aside className="space-y-4 md:sticky md:top-4">
-                        <div className="bg-white dark:bg-gray-800 p-5 rounded-2xl shadow-md border border-slate-200 dark:border-gray-700">
-                             <h2 className="text-xl font-extrabold mb-4 text-slate-800 dark:text-gray-100">📚 Info & Astuces</h2>
-                             <details className="text-sm text-slate-600 dark:text-gray-300 py-2 border-b border-slate-200 dark:border-gray-700"><summary className="font-semibold cursor-pointer">Rythme 21h-12h explication</summary><p className="pt-2">Vous jeûnez de 21h le soir jusqu'à midi le lendemain (15 heures). Vous mangez entre midi et 21h (9 heures). C'est un rythme "15/9", excellent pour la vie sociale et sportive.</p></details>
-                             <details className="text-sm text-slate-600 dark:text-gray-300 py-2 border-b border-slate-200 dark:border-gray-700"><summary className="font-semibold cursor-pointer">Gérer la faim le matin</summary><p className="pt-2">C'est souvent une habitude hormonale (ghréline). Buvez de l'eau, café noir ou thé. La sensation passe en 15min environ.</p></details>
-                             <details className="text-sm text-slate-600 dark:text-gray-300 py-2 border-b border-slate-200 dark:border-gray-700"><summary className="font-semibold cursor-pointer">Boissons autorisées</summary><p className="pt-2">Eau (plate/gazeuse), café noir, thés, tisanes. PAS de sucre, pas de miel, pas de lait (ou une micro goutte si indispensable au début). Pas de jus.</p></details>
-                             <details className="text-sm text-slate-600 dark:text-gray-300 py-2"><summary className="font-semibold cursor-pointer">Repas de 12h idéal</summary><p className="pt-2">Rompez le jeûne en douceur. Protéines (poulet, œufs, poisson), légumes, et bons gras (avocat, huile olive). Évitez une "bombe de sucre".</p></details>
-                        </div>
-                        
-                        <DailyCoach state={dailyCoachState} onAsk={handleAskDailyCoach} />
+      // Update and draw bullets
+      bulletsRef.current = bulletsRef.current.filter(bullet => {
+        bullet.x += bullet.vx;
+        bullet.y += bullet.vy;
 
-                        <div className="space-y-3">
-                            <button onClick={handleValidateWeek} className="w-full text-center py-3 px-6 font-bold text-white bg-emerald-500 rounded-full shadow-lg hover:bg-emerald-600 transition-all hover:scale-105">✅ Valider et finir la semaine</button>
-                        </div>
-                        <div className="flex flex-col items-center gap-3 pt-2">
-                             <a href="https://github.com/thomasmoroy/coach-jeune" target="_blank" rel="noopener noreferrer" className="flex items-center justify-center gap-2 text-xs text-slate-500 dark:text-gray-400 hover:underline">
-                                <GitHubIcon />
-                                Projet sur GitHub
-                            </a>
-                            <a href="https://supabase.com" target="_blank" rel="noopener noreferrer" className="flex items-center justify-center gap-2 text-xs text-slate-500 dark:text-gray-400 hover:underline">
-                                <SupabaseIcon className="text-emerald-500"/>
-                                Powered by Supabase
-                            </a>
-                            <div className="flex items-center gap-2 text-xs font-semibold text-slate-500 dark:text-gray-400 mt-1">
-                                {syncStatus === 'synced' && <><div className="w-2 h-2 rounded-full bg-emerald-500 motion-safe:animate-pulse [animation-iteration-count:1] [animation-duration:1.5s]"></div><span>Synchronisé</span></>}
-                                {syncStatus === 'saving' && <><div className="w-2 h-2 rounded-full bg-amber-500 animate-pulse"></div><span>Sauvegarde...</span></>}
-                                {syncStatus === 'error' && <><div className="w-2 h-2 rounded-full bg-red-500"></div><span className="text-red-500">Erreur de synchro</span></>}
-                            </div>
-                        </div>
-                    </aside>
-                </main>
+        // Remove off-screen bullets
+        if (bullet.y < -50 || bullet.y > CANVAS_HEIGHT + 50 || bullet.x < -50 || bullet.x > CANVAS_WIDTH + 50) {
+          return false;
+        }
+
+        // Draw bullet
+        ctx.save();
+        ctx.shadowBlur = 10;
+        ctx.shadowColor = bullet.color;
+        ctx.fillStyle = bullet.color;
+        ctx.fillRect(bullet.x, bullet.y, bullet.width, bullet.height);
+        ctx.restore();
+
+        return true;
+      });
+
+      // Update and draw enemies
+      enemiesRef.current = enemiesRef.current.filter(enemy => {
+        enemy.x += enemy.vx;
+        enemy.y += enemy.vy;
+
+        // Movement patterns
+        if (enemy.type === 'fast') {
+          enemy.x += Math.sin(frameCountRef.current * 0.1) * 2;
+        }
+
+        // Shooter enemy logic
+        if (enemy.type === 'shooter' && enemy.shootCooldown !== undefined) {
+          enemy.shootCooldown--;
+          if (enemy.shootCooldown <= 0) {
+            enemy.shootCooldown = 120;
+            if (playerRef.current) {
+              const dx = playerRef.current.x - enemy.x;
+              const dy = playerRef.current.y - enemy.y;
+              const dist = Math.sqrt(dx * dx + dy * dy);
+              
+              bulletsRef.current.push({
+                id: Date.now() + Math.random(),
+                x: enemy.x + enemy.width / 2 - 4,
+                y: enemy.y + enemy.height,
+                vx: (dx / dist) * 5,
+                vy: (dy / dist) * 5,
+                width: 8,
+                height: 8,
+                color: COLORS.enemyBullet,
+                health: 1,
+                maxHealth: 1,
+                isPlayer: false,
+                damage: 1,
+              });
+            }
+          }
+        }
+
+        // Remove off-screen enemies
+        if (enemy.y > CANVAS_HEIGHT + 50) {
+          return false;
+        }
+
+        // Draw enemy
+        ctx.save();
+        ctx.shadowBlur = 15;
+        ctx.shadowColor = enemy.color;
+        ctx.fillStyle = enemy.color;
+
+        if (enemy.type === 'tank') {
+          ctx.fillRect(enemy.x, enemy.y, enemy.width, enemy.height);
+        } else if (enemy.type === 'fast') {
+          ctx.beginPath();
+          ctx.moveTo(enemy.x + enemy.width / 2, enemy.y + enemy.height);
+          ctx.lineTo(enemy.x + enemy.width, enemy.y);
+          ctx.lineTo(enemy.x, enemy.y);
+          ctx.closePath();
+          ctx.fill();
+        } else if (enemy.type === 'shooter') {
+          ctx.beginPath();
+          ctx.arc(enemy.x + enemy.width / 2, enemy.y + enemy.height / 2, enemy.width / 2, 0, Math.PI * 2);
+          ctx.fill();
+          // Cannon
+          ctx.fillRect(enemy.x + enemy.width / 2 - 5, enemy.y + enemy.height, 10, 10);
+        } else {
+          ctx.beginPath();
+          ctx.moveTo(enemy.x + enemy.width / 2, enemy.y + enemy.height);
+          ctx.lineTo(enemy.x + enemy.width, enemy.y + enemy.height / 2);
+          ctx.lineTo(enemy.x + enemy.width / 2, enemy.y);
+          ctx.lineTo(enemy.x, enemy.y + enemy.height / 2);
+          ctx.closePath();
+          ctx.fill();
+        }
+
+        // Health bar for tanks
+        if (enemy.type === 'tank' && enemy.health < enemy.maxHealth) {
+          ctx.fillStyle = '#ff0000';
+          ctx.fillRect(enemy.x, enemy.y - 8, enemy.width, 4);
+          ctx.fillStyle = '#00ff00';
+          ctx.fillRect(enemy.x, enemy.y - 8, enemy.width * (enemy.health / enemy.maxHealth), 4);
+        }
+
+        ctx.restore();
+
+        // Check collision with player
+        if (playerRef.current && !playerRef.current.invincible && checkCollision(playerRef.current, enemy)) {
+          soundSystem.playPlayerHit();
+          playerRef.current.invincible = true;
+          playerRef.current.invincibleTimer = 120; // 2 seconds at 60fps
+          createExplosion(enemy.x + enemy.width / 2, enemy.y + enemy.height / 2, enemy.color, 20);
+          
+          setGameState(prev => {
+            const newLives = prev.lives - 1;
+            if (newLives <= 0) {
+              soundSystem.playGameOver();
+              const newHighScore = Math.max(prev.score, prev.highScore);
+              localStorage.setItem('shmup_highscore', newHighScore.toString());
+              return { ...prev, lives: 0, isGameOver: true, highScore: newHighScore };
+            }
+            return { ...prev, lives: newLives };
+          });
+          setUiLives(prev => prev - 1);
+          
+          return false; // Destroy enemy on collision
+        }
+
+        return true;
+      });
+
+      // Check bullet collisions
+      bulletsRef.current = bulletsRef.current.filter(bullet => {
+        let shouldRemove = false;
+
+        if (bullet.isPlayer) {
+          // Player bullet hitting enemies
+          enemiesRef.current = enemiesRef.current.filter(enemy => {
+            if (checkCollision(bullet, enemy)) {
+              enemy.health -= bullet.damage;
+              soundSystem.playEnemyHit();
+              createExplosion(bullet.x, bullet.y, bullet.color, 3);
+              shouldRemove = true;
+
+              if (enemy.health <= 0) {
+                soundSystem.playExplosion();
+                createExplosion(enemy.x + enemy.width / 2, enemy.y + enemy.height / 2, enemy.color, 20);
+                spawnPowerUp(enemy.x + enemy.width / 2, enemy.y + enemy.height / 2);
+                
+                // Update score with combo
+                setGameState(prev => {
+                  const comboMultiplier = 1 + Math.floor(prev.combo / 10) * 0.1;
+                  const points = Math.floor(enemy.scoreValue * comboMultiplier);
+                  return { 
+                    ...prev, 
+                    score: prev.score + points,
+                    combo: prev.combo + 1,
+                    comboTimer: 180 // 3 seconds to maintain combo
+                  };
+                });
+                setUiScore(prev => {
+                  const state = gameState;
+                  const comboMultiplier = 1 + Math.floor(state.combo / 10) * 0.1;
+                  return prev + Math.floor(enemy.scoreValue * comboMultiplier);
+                });
+              }
+              return false;
+            }
+            return true;
+          });
+        } else {
+          // Enemy bullet hitting player
+          if (playerRef.current && !playerRef.current.invincible && checkCollision(playerRef.current, bullet)) {
+            soundSystem.playPlayerHit();
+            playerRef.current.invincible = true;
+            playerRef.current.invincibleTimer = 120;
+            createExplosion(bullet.x, bullet.y, bullet.color, 10);
+            shouldRemove = true;
+
+            setGameState(prev => {
+              const newLives = prev.lives - 1;
+              if (newLives <= 0) {
+                soundSystem.playGameOver();
+                const newHighScore = Math.max(prev.score, prev.highScore);
+                localStorage.setItem('shmup_highscore', newHighScore.toString());
+                return { ...prev, lives: 0, isGameOver: true, highScore: newHighScore };
+              }
+              return { ...prev, lives: newLives };
+            });
+            setUiLives(prev => prev - 1);
+          }
+        }
+
+        return !shouldRemove;
+      });
+
+      // Update and draw power-ups
+      powerUpsRef.current = powerUpsRef.current.filter(powerUp => {
+        powerUp.y += powerUp.vy;
+
+        if (powerUp.y > CANVAS_HEIGHT) {
+          return false;
+        }
+
+        // Draw power-up
+        ctx.save();
+        ctx.shadowBlur = 15;
+        ctx.shadowColor = 
+          powerUp.type === 'weapon' ? COLORS.powerupWeapon :
+          powerUp.type === 'health' ? COLORS.powerupHealth :
+          powerUp.type === 'shield' ? COLORS.powerupShield : COLORS.powerupBomb;
+        ctx.fillStyle = ctx.shadowColor;
+        
+        ctx.beginPath();
+        ctx.arc(powerUp.x + powerUp.width / 2, powerUp.y + powerUp.height / 2, powerUp.width / 2, 0, Math.PI * 2);
+        ctx.fill();
+        
+        // Icon
+        ctx.fillStyle = '#000';
+        ctx.font = 'bold 16px Arial';
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'middle';
+        const icon = 
+          powerUp.type === 'weapon' ? 'W' :
+          powerUp.type === 'health' ? '+' :
+          powerUp.type === 'shield' ? 'S' : 'B';
+        ctx.fillText(icon, powerUp.x + powerUp.width / 2, powerUp.y + powerUp.height / 2);
+        
+        ctx.restore();
+
+        // Check collision with player
+        if (playerRef.current && checkCollision(playerRef.current, powerUp)) {
+          soundSystem.playPowerUp();
+          
+          if (powerUp.type === 'weapon') {
+            playerRef.current.weaponLevel = Math.min(playerRef.current.weaponLevel + 1, 3);
+          } else if (powerUp.type === 'health') {
+            setGameState(prev => ({ ...prev, lives: Math.min(prev.lives + 1, 5) }));
+            setUiLives(prev => Math.min(prev + 1, 5));
+          } else if (powerUp.type === 'shield') {
+            playerRef.current.invincible = true;
+            playerRef.current.invincibleTimer = 600; // 10 seconds
+          } else if (powerUp.type === 'bomb') {
+            // Destroy all enemies on screen
+            enemiesRef.current.forEach(enemy => {
+              createExplosion(enemy.x + enemy.width / 2, enemy.y + enemy.height / 2, enemy.color, 15);
+              soundSystem.playExplosion();
+              setGameState(prev => ({ ...prev, score: prev.score + enemy.scoreValue }));
+            });
+            enemiesRef.current = [];
+          }
+          
+          setUiScore(prev => prev + 50);
+          return false;
+        }
+
+        return true;
+      });
+
+      // Update and draw particles
+      particlesRef.current = particlesRef.current.filter(particle => {
+        particle.x += particle.vx;
+        particle.y += particle.vy;
+        particle.life -= particle.decay;
+        particle.vx *= 0.95;
+        particle.vy *= 0.95;
+
+        if (particle.life <= 0) {
+          return false;
+        }
+
+        ctx.save();
+        ctx.globalAlpha = particle.life;
+        ctx.fillStyle = particle.color;
+        ctx.beginPath();
+        ctx.arc(particle.x, particle.y, particle.size, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.restore();
+
+        return true;
+      });
+
+      // Update combo timer
+      setGameState(prev => {
+        if (prev.comboTimer > 0) {
+          return { ...prev, comboTimer: prev.comboTimer - 1 };
+        } else if (prev.combo > 0) {
+          setUiCombo(0);
+          return { ...prev, combo: 0 };
+        }
+        return prev;
+      });
+      setUiCombo(gameState.combo);
+
+      // Level progression
+      if (frameCountRef.current % 600 === 0) { // Every 10 seconds
+        setGameState(prev => ({ ...prev, level: prev.level + 1 }));
+        setUiLevel(prev => prev + 1);
+        enemySpawnRateRef.current = Math.max(20, enemySpawnRateRef.current - 5);
+      }
+
+      // Draw HUD
+      ctx.fillStyle = COLORS.text;
+      ctx.font = 'bold 20px Arial';
+      ctx.textAlign = 'left';
+      ctx.fillText(`SCORE: ${uiScore}`, 20, 30);
+      ctx.fillText(`LIVES: ${'❤️'.repeat(uiLives)}`, 20, 60);
+      ctx.fillText(`LEVEL: ${uiLevel}`, 20, 90);
+      
+      if (uiCombo > 5) {
+        ctx.fillStyle = '#ff00ff';
+        ctx.font = 'bold 24px Arial';
+        ctx.textAlign = 'center';
+        ctx.fillText(`COMBO x${uiCombo}!`, CANVAS_WIDTH / 2, 50);
+      }
+
+      animationFrameRef.current = requestAnimationFrame(gameLoop);
+    };
+
+    animationFrameRef.current = requestAnimationFrame(gameLoop);
+
+    return () => {
+      if (animationFrameRef.current) {
+        cancelAnimationFrame(animationFrameRef.current);
+      }
+    };
+  }, [gameState.isPlaying, gameState.isPaused, gameState.isGameOver, spawnEnemy, createExplosion, spawnPowerUp]);
+
+  return (
+    <div className="min-h-screen bg-gray-900 flex items-center justify-center p-4">
+      <div className="relative">
+        <canvas
+          ref={canvasRef}
+          width={CANVAS_WIDTH}
+          height={CANVAS_HEIGHT}
+          className="border-4 border-purple-500 rounded-lg shadow-2xl shadow-purple-500/50"
+          style={{ maxWidth: '100%', height: 'auto' }}
+        />
+
+        {/* Start Screen */}
+        {!gameState.isPlaying && !gameState.isGameOver && (
+          <div className="absolute inset-0 bg-black/80 flex flex-col items-center justify-center rounded-lg">
+            <h1 className="text-6xl font-bold text-transparent bg-clip-text bg-gradient-to-r from-cyan-400 via-magenta-500 to-yellow-400 mb-4 animate-pulse"
+                style={{ textShadow: '0 0 20px #00ffff, 0 0 40px #ff00ff' }}>
+              NEON BLASTER
+            </h1>
+            <p className="text-white text-xl mb-8">Un Shoot 'Em Up d'exception</p>
+            
+            <div className="bg-gray-800/90 p-6 rounded-lg mb-8 text-left">
+              <h2 className="text-2xl font-bold text-cyan-400 mb-4">Contrôles</h2>
+              <div className="text-white space-y-2">
+                <p>⬆️⬇️⬅️➡️ ou ZQSD - Déplacement</p>
+                <p>ESPACE - Tirer</p>
+                <p>ÉCHAP - Pause</p>
+              </div>
+              
+              <h2 className="text-2xl font-bold text-magenta-400 mt-6 mb-4">Power-Ups</h2>
+              <div className="text-white space-y-2">
+                <p><span className="text-green-400 font-bold">W</span> - Amélioration d'arme</p>
+                <p><span className="text-pink-400 font-bold">+</span> - Vie supplémentaire</p>
+                <p><span className="text-blue-400 font-bold">S</span> - Bouclier temporaire</p>
+                <p><span className="text-orange-400 font-bold">B</span> - Bombe (détruie tout)</p>
+              </div>
             </div>
-            <SummaryModal isOpen={isSummaryModalOpen} onClose={handleNextWeek} days={state.days} />
-            <HistoryModal isOpen={isHistoryModalOpen} onClose={() => setHistoryModalOpen(false)} history={state.history} />
+
+            <button
+              onClick={startGame}
+              className="px-8 py-4 bg-gradient-to-r from-cyan-500 to-magenta-500 text-white text-2xl font-bold rounded-full hover:scale-110 transition-transform shadow-lg shadow-cyan-500/50"
+            >
+              COMMENCER
+            </button>
+            
+            {gameState.highScore > 0 && (
+              <p className="text-yellow-400 mt-4 text-lg">Meilleur Score: {gameState.highScore}</p>
+            )}
+          </div>
+        )}
+
+        {/* Pause Screen */}
+        {gameState.isPaused && (
+          <div className="absolute inset-0 bg-black/80 flex flex-col items-center justify-center rounded-lg">
+            <h2 className="text-5xl font-bold text-yellow-400 mb-8">PAUSE</h2>
+            <button
+              onClick={() => setGameState(prev => ({ ...prev, isPaused: false }))}
+              className="px-8 py-4 bg-gradient-to-r from-green-500 to-blue-500 text-white text-2xl font-bold rounded-full hover:scale-110 transition-transform"
+            >
+              REPRENDRE
+            </button>
+            <p className="text-white mt-4">ou appuyez sur ÉCHAP</p>
+          </div>
+        )}
+
+        {/* Game Over Screen */}
+        {gameState.isGameOver && (
+          <div className="absolute inset-0 bg-black/80 flex flex-col items-center justify-center rounded-lg">
+            <h2 className="text-6xl font-bold text-red-500 mb-4 animate-pulse">GAME OVER</h2>
+            <p className="text-white text-3xl mb-2">Score Final: {uiScore}</p>
+            {uiScore >= gameState.highScore && uiScore > 0 && (
+              <p className="text-yellow-400 text-2xl mb-4 animate-bounce">🏆 NOUVEAU RECORD ! 🏆</p>
+            )}
+            <p className="text-gray-400 text-xl mb-8">Meilleur Score: {Math.max(uiScore, gameState.highScore)}</p>
+            <button
+              onClick={startGame}
+              className="px-8 py-4 bg-gradient-to-r from-red-500 to-orange-500 text-white text-2xl font-bold rounded-full hover:scale-110 transition-transform shadow-lg shadow-red-500/50"
+            >
+              REJOUER
+            </button>
+            <p className="text-white mt-4">ou appuyez sur ENTRÉE</p>
+          </div>
+        )}
+      </div>
+
+      {/* Mobile Controls */}
+      <div className="fixed bottom-4 left-4 md:hidden">
+        <div className="grid grid-cols-3 gap-2">
+          <div></div>
+          <button
+            className="w-16 h-16 bg-gray-700/80 rounded-full text-white text-2xl active:bg-gray-600"
+            onTouchStart={() => keysRef.current['ArrowUp'] = true}
+            onTouchEnd={() => keysRef.current['ArrowUp'] = false}
+          >
+            ⬆️
+          </button>
+          <div></div>
+          <button
+            className="w-16 h-16 bg-gray-700/80 rounded-full text-white text-2xl active:bg-gray-600"
+            onTouchStart={() => keysRef.current['ArrowLeft'] = true}
+            onTouchEnd={() => keysRef.current['ArrowLeft'] = false}
+          >
+            ⬅️
+          </button>
+          <button
+            className="w-16 h-16 bg-gray-700/80 rounded-full text-white text-2xl active:bg-gray-600"
+            onTouchStart={() => keysRef.current['ArrowDown'] = true}
+            onTouchEnd={() => keysRef.current['ArrowDown'] = false}
+          >
+            ⬇️
+          </button>
+          <button
+            className="w-16 h-16 bg-gray-700/80 rounded-full text-white text-2xl active:bg-gray-600"
+            onTouchStart={() => keysRef.current['ArrowRight'] = true}
+            onTouchEnd={() => keysRef.current['ArrowRight'] = false}
+          >
+            ➡️
+          </button>
         </div>
-    );
+      </div>
+
+      <div className="fixed bottom-4 right-4 md:hidden">
+        <button
+          className="w-20 h-20 bg-red-700/80 rounded-full text-white text-xl font-bold active:bg-red-600 shadow-lg"
+          onTouchStart={() => keysRef.current['Space'] = true}
+          onTouchEnd={() => keysRef.current['Space'] = false}
+        >
+          TIRER
+        </button>
+      </div>
+    </div>
+  );
 };
 
 export default App;
