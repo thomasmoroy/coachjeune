@@ -5,6 +5,8 @@ export interface DayState {
   selectedActivity: string;
   activityDone: boolean;
   note: string;
+  pushUpsCompleted: number;
+  pushUpsSets: number[];
 }
 
 export interface WeekHistory {

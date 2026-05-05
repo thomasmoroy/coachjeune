@@ -214,9 +214,10 @@ interface DayCardProps {
     onActivityChange: (index: number, activity: string) => void;
     onToggleActivityDone: (index: number, el: HTMLElement) => void;
     onNoteChange: (index: number, note: string) => void;
+    onAddPushUpsSet: (index: number, reps: number) => void;
 }
 
-const DayCard: React.FC<DayCardProps> = ({ dayIndex, dayState, onToggleDone, onSetMood, onActivityChange, onToggleActivityDone, onNoteChange }) => {
+const DayCard: React.FC<DayCardProps> = ({ dayIndex, dayState, onToggleDone, onSetMood, onActivityChange, onToggleActivityDone, onNoteChange, onAddPushUpsSet }) => {
     const dayDesc = DAY_DESCRIPTIONS[dayIndex];
     let currentDayIndex = new Date().getDay() - 1;
     if (currentDayIndex === -1) currentDayIndex = 6;
@@ -224,10 +225,22 @@ const DayCard: React.FC<DayCardProps> = ({ dayIndex, dayState, onToggleDone, onS
 
     const checkRef = useRef<HTMLDivElement>(null);
     const activityCheckRef = useRef<HTMLDivElement>(null);
+    const pushUpsInputRef = useRef<HTMLInputElement>(null);
     
     const baseCardClasses = "transition-all duration-300 rounded-xl p-5 border";
     const typeCardClasses = dayDesc.rest ? "bg-amber-50 border-amber-200 dark:bg-gray-800/50 dark:border-amber-900/50" : "bg-white border-slate-200 dark:bg-gray-800 dark:border-gray-700";
     const stateCardClasses = dayState.done ? "opacity-60" : "shadow-md";
+
+    const handleAddSet = () => {
+        const input = pushUpsInputRef.current;
+        if (input && input.value) {
+            const reps = parseInt(input.value, 10);
+            if (reps > 0 && reps <= 100) {
+                onAddPushUpsSet(dayIndex, reps);
+                input.value = '';
+            }
+        }
+    };
 
     return (
         <div className={`day-card ${baseCardClasses} ${typeCardClasses} ${stateCardClasses} ${isToday ? 'is-today' : ''} ${dayState.done ? 'completed' : ''}`}>
@@ -273,6 +286,49 @@ const DayCard: React.FC<DayCardProps> = ({ dayIndex, dayState, onToggleDone, onS
                                     className="w-full bg-slate-100 dark:bg-gray-900/50 border border-slate-200 dark:border-gray-600 rounded-md p-2 text-sm text-slate-700 dark:text-gray-200 outline-none focus:ring-2 focus:ring-blue-500"
                                     rows={2}
                                 />
+                            </div>
+
+                            <div className={`mt-4 pt-3 border-t border-dashed border-emerald-200 dark:border-emerald-900/50 ${dayState.done ? 'opacity-50' : ''}`}>
+                                <div className="flex items-center justify-between mb-2">
+                                    <h4 className="font-bold text-emerald-700 dark:text-emerald-400 text-sm">💪 Programme 100 Pompes</h4>
+                                    <span className="text-xs font-semibold bg-emerald-100 dark:bg-emerald-900 text-emerald-800 dark:text-emerald-200 px-2 py-1 rounded-full">
+                                        {dayState.pushUpsCompleted}/100
+                                    </span>
+                                </div>
+                                
+                                <div className="flex gap-2 mb-2">
+                                    <input
+                                        ref={pushUpsInputRef}
+                                        type="number"
+                                        min="1"
+                                        max="100"
+                                        placeholder="Répétitions (ex: 15)"
+                                        className="flex-1 bg-slate-100 dark:bg-gray-900/50 border border-slate-200 dark:border-gray-600 rounded-md p-2 text-sm text-slate-700 dark:text-gray-200 outline-none focus:ring-2 focus:ring-emerald-500"
+                                        onKeyDown={(e) => e.key === 'Enter' && handleAddSet()}
+                                    />
+                                    <button
+                                        onClick={handleAddSet}
+                                        className="px-4 py-2 bg-emerald-500 hover:bg-emerald-600 text-white font-bold rounded-md transition-colors text-sm"
+                                    >
+                                        Ajouter
+                                    </button>
+                                </div>
+
+                                {dayState.pushUpsSets.length > 0 && (
+                                    <div className="flex flex-wrap gap-1 mt-2">
+                                        {dayState.pushUpsSets.map((set, idx) => (
+                                            <span key={idx} className="text-xs bg-emerald-100 dark:bg-emerald-900/50 text-emerald-800 dark:text-emerald-200 px-2 py-1 rounded-md font-mono">
+                                                Série {idx + 1}: {set} reps
+                                            </span>
+                                        ))}
+                                    </div>
+                                )}
+                                
+                                {dayState.pushUpsCompleted >= 100 && (
+                                    <div className="mt-2 text-xs font-bold text-emerald-600 dark:text-emerald-400 flex items-center gap-1">
+                                        🎯 Objectif 100 pompes atteint ! Félicitations !
+                                    </div>
+                                )}
                             </div>
                         </>
                     )}
@@ -453,7 +509,7 @@ const App: React.FC = () => {
                 setState({
                     week: 1,
                     theme: window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light',
-                    days: Array(7).fill(null).map(() => ({ done: false, mood: null, selectedActivity: 'Aucune', activityDone: false, note: '' })),
+                    days: Array(7).fill(null).map(() => ({ done: false, mood: null, selectedActivity: 'Aucune', activityDone: false, note: '', pushUpsCompleted: 0, pushUpsSets: [] })),
                     history: [],
                 });
                 setSyncStatus('synced');
@@ -545,6 +601,22 @@ const App: React.FC = () => {
         });
     }, []);
 
+    const handleAddPushUpsSet = useCallback((index: number, reps: number) => {
+        setState(prevState => {
+            if (prevState === 'loading') return prevState;
+            const newDays = [...prevState.days];
+            const currentDay = newDays[index];
+            const newSets = [...currentDay.pushUpsSets, reps];
+            const newTotal = currentDay.pushUpsCompleted + reps;
+            newDays[index] = { 
+                ...currentDay, 
+                pushUpsSets: newSets,
+                pushUpsCompleted: newTotal 
+            };
+            return { ...prevState, days: newDays };
+        });
+    }, []);
+
     const handleValidateWeek = useCallback(() => {
         if (state === 'loading') return;
         const doneCount = state.days.slice(0, 5).filter(d => d.done).length;
@@ -562,7 +634,7 @@ const App: React.FC = () => {
             return {
                 ...prevState,
                 week: prevState.week + 1,
-                days: Array(7).fill(null).map(() => ({ done: false, mood: null, selectedActivity: "Aucune", activityDone: false, note: "" })),
+                days: Array(7).fill(null).map(() => ({ done: false, mood: null, selectedActivity: "Aucune", activityDone: false, note: "", pushUpsCompleted: 0, pushUpsSets: [] })),
                 history: newHistory,
             };
         });
@@ -650,7 +722,7 @@ Donne-lui un court conseil (2-3 phrases) pour la journée en cours ou pour l'aid
                         </div>
                         <div className="space-y-4">
                             {state.days.map((dayState, i) => (
-                                <DayCard key={i} dayIndex={i} dayState={dayState} onToggleDone={handleToggleDone} onSetMood={handleSetMood} onActivityChange={handleActivityChange} onToggleActivityDone={handleToggleActivityDone} onNoteChange={handleNoteChange} />
+                                <DayCard key={i} dayIndex={i} dayState={dayState} onToggleDone={handleToggleDone} onSetMood={handleSetMood} onActivityChange={handleActivityChange} onToggleActivityDone={handleToggleActivityDone} onNoteChange={handleNoteChange} onAddPushUpsSet={handleAddPushUpsSet} />
                             ))}
                         </div>
                     </section>
