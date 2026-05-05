@@ -1,24 +1,94 @@
-# Logs
-logs
+```
+# Dependencies
+node_modules/
+
+# Environment
+.env
+.env.local
+.env.*
+
+# Build artifacts
+dist/
+build/
+target/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+.venv/
+.venv.bak/
+pip-log.txt
+pip-delete-this-directory.txt
+.tox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
 *.log
+*.pot
+*.po
+*~
+.pytest_cache/
+.mypy_cache/
+.hypothesis/
+
+# Node
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
-pnpm-debug.log*
-lerna-debug.log*
+node_modules/
+jspm_packages/
+web_modules/
+*.tsbuildinfo
+.next/
+.nuxt/
+.vuepress/dist
+.static
+.svelte-kit/
+.output/
 
-node_modules
-dist
-dist-ssr
-*.local
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
 
-# Editor directories and files
-.vscode/*
-!.vscode/extensions.json
-.idea
+# OS
 .DS_Store
-*.suo
-*.ntvs*
-*.njsproj
-*.sln
-*.sw?
+Thumbs.db
+ehthumbs.db
+Icon?
+.directory
+*.nib
+.vagrant
+.Vagrantfile
+config/vagrant-*.yml
+
+# Logs
+*.log
+*.out
+
+# Temp
+*.tmp
+*.temp
+.tmp
+.temp
+
+# Coverage
+coverage/
+htmlcov/
+.coverage
+.coverage.*
+.nyc_output
+istanbul/
+.lcovonly
+.nyc_output/
+```
